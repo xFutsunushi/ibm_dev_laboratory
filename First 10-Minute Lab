@@ -1,0 +1,273 @@
+# First 10‑Minute Lab
+
+## IBM MQ + ACE + DataPower (Docker Compose)
+
+This short lab is meant to prove the stack is alive without spending an hour clicking around.
+
+You will:
+
+1. Confirm containers are running
+2. Confirm MQ queue manager is running and `Q1` exists
+3. Put a test message to `Q1` and browse it in MQ
+4. (Optional) Create a simple ACE HTTP check endpoint (quick dev-only approach)
+5. (Optional) Put DataPower in front of ACE (concept + quick checks)
+
+> Assumptions:
+>
+> * Your Docker host is reachable as **`docker.local`**
+> * You started the stack via `cd mq-ace-dp && docker compose up -d`
+
+---
+
+## 0) Sanity check: containers and ports
+
+From the project directory:
+
+```bash
+cd mq-ace-dp
+docker compose ps
+```
+
+Expected:
+
+* `mq` is **Up**
+* `ace` is **Up**
+* `datapower` is **Up**
+
+Quick port check from your workstation (optional):
+
+```bash
+# MQ Console (HTTPS)
+curl -kI https://docker.local:9443/ || true
+
+# ACE UI
+curl -I http://docker.local:7600/ || true
+
+# DataPower (may differ by configuration)
+curl -I http://docker.local:9090/ || true
+```
+
+---
+
+## 1) MQ: verify the queue manager is running
+
+```bash
+docker exec -it mq dspmq
+```
+
+Expected: `QM1` should be **Running**.
+
+Check MQ version (optional):
+
+```bash
+docker exec -it mq dspmqver
+```
+
+---
+
+## 2) MQ: verify the lab queue `Q1` exists
+
+```bash
+docker exec -it mq bash -lc "echo 'DISPLAY QLOCAL(Q1)' | runmqsc QM1"
+```
+
+Expected: definition of `Q1` displayed.
+
+If it does not exist, your `mq/mqsc/config.mqsc` was not applied. Most common causes:
+
+* the file wasn’t mounted to `/etc/mqm/config.mqsc`
+* the queue manager data directory is not clean and MQ skipped initialization
+
+Fix (dev):
+
+```bash
+cd mq-ace-dp
+docker compose down
+rm -rf mq/data/*
+docker compose up -d
+```
+
+---
+
+## 3) MQ: put a test message to `Q1`
+
+### Option A (simple): use `amqsput` inside the MQ container
+
+Run:
+
+```bash
+docker exec -it mq bash -lc 'printf "Hello from MQ lab @ %s\n" "$(date)" | /opt/mqm/samp/bin/amqsput Q1 QM1'
+```
+
+Expected: it should connect and put a message.
+
+### Option B (interactive): type a message manually
+
+```bash
+docker exec -it mq bash -lc '/opt/mqm/samp/bin/amqsput Q1 QM1'
+```
+
+Type a line, press Enter, then press Enter again on an empty line to finish.
+
+---
+
+## 4) MQ Console: browse the message (web)
+
+Open:
+
+* **MQ Console:** `https://docker.local:9443/`
+
+Then:
+
+1. Open the Queue Manager (`QM1`)
+2. Go to **Queues**
+3. Open `Q1`
+4. Use **Browse messages**
+
+If your browser warns about a certificate, accept it (dev environment).
+
+---
+
+## 5) ACE quick check (no flow yet)
+
+ACE’s web UI should be reachable:
+
+* `http://docker.local:7600/`
+
+This step only verifies the runtime/UI is up.
+
+### (Optional) Quick “health endpoint” approach
+
+ACE is normally used with Toolkit + BAR deployments.
+
+For a fast lab check, keep it simple:
+
+* confirm the container is alive
+* later you will deploy a real BAR
+
+Basic container check:
+
+```bash
+docker exec -it ace bash -lc 'uname -a; id; ls -la'
+```
+
+---
+
+## 6) Optional: ACE ↔ MQ connectivity check
+
+The best way is to deploy a simple flow (HTTP input → MQ output). If you don’t have a BAR yet:
+
+### Minimal check from inside ACE container
+
+1. Confirm DNS resolution of MQ service name:
+
+```bash
+docker exec -it ace bash -lc 'getent hosts mq && echo OK'
+```
+
+2. Confirm MQ port is reachable from ACE:
+
+```bash
+docker exec -it ace bash -lc 'timeout 2 bash -c "</dev/tcp/mq/1414" && echo OK || echo FAIL'
+```
+
+If `FAIL`, check:
+
+* both services are on the same network
+* MQ is actually listening on 1414
+
+---
+
+## 7) Optional: DataPower in front of ACE (concept + quick check)
+
+In a typical enterprise setup:
+
+* DataPower terminates TLS, enforces policies, rate-limits, and forwards requests
+* ACE handles integration and business routing
+
+### Quick checks
+
+1. Confirm DataPower container is up:
+
+```bash
+docker logs --tail=80 datapower
+```
+
+2. Confirm it can resolve ACE:
+
+```bash
+docker exec -it datapower sh -lc 'getent hosts ace || true'
+```
+
+3. Confirm ACE port is reachable from DataPower (if shell is available):
+
+```bash
+# This may not work on all DP images depending on available shell/tools.
+docker exec -it datapower sh -lc 'timeout 2 sh -c "</dev/tcp/ace/7800" && echo OK || echo FAIL' || true
+```
+
+> DataPower configuration (services, domains, reverse proxy) is usually done via WebGUI/XML mgmt.
+> This lab only verifies basic connectivity.
+
+---
+
+## 8) What “done” looks like
+
+You’re done when:
+
+* `docker compose ps` shows all services **Up**
+* `dspmq` shows `QM1` **Running**
+* you can browse a message on `Q1` in MQ Console
+* ACE UI loads at `http://docker.local:7600/`
+
+---
+
+## Troubleshooting checklist
+
+If something fails, collect this bundle:
+
+```bash
+cd mq-ace-dp
+docker compose ps
+for c in mq ace datapower; do
+  echo "===== $c ====="
+  docker logs --tail=200 "$c"
+done
+
+# MQ essentials
+ls -ld mq/data
+getenforce 2>/dev/null || true
+```
+
+Common quick fixes:
+
+* **MQ data corruption / damaged QM:** reset MQ data
+
+  ```bash
+  docker compose down
+  rm -rf mq/data/*
+  docker compose up -d
+  ```
+
+* **MQ permission denied on /mnt/mqm:** fix owner/mode
+
+  ```bash
+  sudo chown -R 1001:0 mq/data
+  sudo chmod -R 2775 mq/data
+  ```
+
+* **Low open-files limit (nofile):** ensure Compose sets ulimits and restart
+
+---
+
+## Next lab (recommended)
+
+Create a tiny ACE flow:
+
+* HTTP Input (`/ping`) → MQ Output (put to `Q1`)
+* Another flow: MQ Input (`Q1`) → HTTP Reply (or file output)
+
+Then put DataPower in front of ACE:
+
+* DataPower front URL → forwards to ACE `/ping`
+* Add basic policy (allowlist, rate-limit)
