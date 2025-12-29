@@ -1,16 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ---------------------------------------------------------------------
-# bootstrap_mq_ace_dp.sh
-# MQ + ACE + DataPower (docker compose) with sane bootstrap:
-#  - MQ: MQSC readable (0444), mount as /etc/mqm/config.mqsc (no masking /etc/mqm)
-#  - MQ: ulimit nofile >= 10240
-#  - ACE: init workdir via mqsicreateworkdir (so overrides/server.conf.yaml works)
-#  - ACE: enable Web UI auth + create/modify web user (mqsiwebuseradmin)
-#  - DP : enable WebGUI via auto-startup.cfg
-# ---------------------------------------------------------------------
-
 trap 'echo "[FATAL] Unhandled error on line ${LINENO} (exit code $?)" >&2' ERR
 
 PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)/mq-ace-dp}"
@@ -27,31 +17,30 @@ MQ_QMGR_NAME="${MQ_QMGR_NAME:-QM1}"
 NOFILE_SOFT="${NOFILE_SOFT:-10240}"
 NOFILE_HARD="${NOFILE_HARD:-10240}"
 
-# ACE Web UI
-ACE_WEB_USER="${ACE_WEB_USER:-admin}"
-ACE_WEB_PASS_FILE="${ACE_WEB_PASS_FILE:-secrets/aceWebAdminPassword}"
+# ACE Web UI user
+ACE_WEB_USER="${ACE_WEB_USER:-Admin}"
 
 # DataPower WebGUI
 DP_WEBGUI_BIND="${DP_WEBGUI_BIND:-0.0.0.0}"
 DP_WEBGUI_PORT="${DP_WEBGUI_PORT:-9090}"
 
-# Optional: fail-fast if docker run would hang (0 disables)
-DOCKER_RUN_TIMEOUT="${DOCKER_RUN_TIMEOUT:-0}"
+# Optional timeout for one-shot docker runs (seconds); 0 disables
+DOCKER_RUN_TIMEOUT="${DOCKER_RUN_TIMEOUT:-180}"
 
 usage() {
   cat <<EOF
 Usage: $0 [--fresh|--refresh] [--project-root PATH] [--debug]
 
-  --fresh/--refresh  Wipe persisted MQ/ACE/DP dirs before start
+  --fresh/--refresh  Wipe MQ/ACE/DP dirs before start
   --project-root     Project directory (default: ${PROJECT_ROOT})
   --debug            Enable bash xtrace
 
 Env overrides:
   PROJECT_ROOT, MQ_IMAGE, ACE_IMAGE, DP_IMAGE, MQ_QMGR_NAME
   NOFILE_SOFT, NOFILE_HARD
-  ACE_WEB_USER, ACE_WEB_PASS_FILE
+  ACE_WEB_USER
   DP_WEBGUI_BIND, DP_WEBGUI_PORT
-  DOCKER_RUN_TIMEOUT (seconds, 0 disables)
+  DOCKER_RUN_TIMEOUT
 EOF
 }
 
@@ -96,7 +85,6 @@ ensure_secret_file() {
   if [[ -s "$path" ]]; then
     log "INFO" "Keeping existing secret: $path"
   else
-    # IMPORTANT: keep umask local (do not leak to rest of script)
     ( umask 077
       printf "%s" "$value" > "$path"
       chmod 600 "$path" || true
@@ -132,7 +120,6 @@ selinux_label_if_enforcing() {
 fix_mq_data_perms() {
   local dir="$1"
   mkdir -p "$dir"
-  # MQ container runs as UID 1001, group 0
   chown -R 1001:0 "$dir" || true
   chmod -R u+rwX,g+rwX "$dir" || true
   chmod 2775 "$dir" || true
@@ -145,8 +132,15 @@ validate_port() {
   return 0
 }
 
-# Run a one-shot command in an image without executing its ENTRYPOINT.
-# This prevents "hanging" when images start their own long-running process.
+run_timeout() {
+  if [[ "${DOCKER_RUN_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null 2>&1; then
+    timeout "${DOCKER_RUN_TIMEOUT}" "$@"
+  else
+    "$@"
+  fi
+}
+
+# One-shot command runner that NEVER executes image ENTRYPOINT (prevents hangs)
 docker_run_shell() {
   local image="$1"; shift
   local args=()
@@ -157,17 +151,22 @@ docker_run_shell() {
   shift
   local cmd="$*"
 
-  local timeout_prefix=()
-  if [[ "${DOCKER_RUN_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null 2>&1; then
-    timeout_prefix=(timeout "${DOCKER_RUN_TIMEOUT}")
-  fi
-
-  # Prefer bash if present; fallback to sh
-  if "${timeout_prefix[@]}" docker run --rm --entrypoint bash "${args[@]}" "$image" -lc 'true' >/dev/null 2>&1; then
-    "${timeout_prefix[@]}" docker run --rm --entrypoint bash "${args[@]}" "$image" -lc "$cmd"
+  # prefer bash, fallback to sh
+  if run_timeout docker run --rm --entrypoint bash "${args[@]}" "$image" -lc 'true' >/dev/null 2>&1; then
+    run_timeout docker run --rm --entrypoint bash "${args[@]}" "$image" -lc "$cmd"
   else
-    "${timeout_prefix[@]}" docker run --rm --entrypoint sh "${args[@]}" "$image" -lc "$cmd"
+    run_timeout docker run --rm --entrypoint sh "${args[@]}" "$image" -lc "$cmd"
   fi
+}
+
+ace_get_uid_gid() {
+  local out uid gid
+  out="$(docker_run_shell "$ACE_IMAGE" -e LICENSE=accept -- 'id -u aceuser 2>/dev/null; id -g aceuser 2>/dev/null' | tail -n 2 || true)"
+  uid="$(echo "$out" | head -n1 | tr -d '\r' || true)"
+  gid="$(echo "$out" | tail -n1 | tr -d '\r' || true)"
+  [[ "$uid" =~ ^[0-9]+$ ]] || uid=1000
+  [[ "$gid" =~ ^[0-9]+$ ]] || gid=0
+  printf "%s:%s" "$uid" "$gid"
 }
 
 ace_workdir_valid() {
@@ -175,89 +174,10 @@ ace_workdir_valid() {
   [[ -d "$wd/config/common" ]]
 }
 
-ace_get_uid_gid() {
-  # Determine aceuser UID:GID from image (for chown on host)
-  local out
-  out="$(docker_run_shell "$ACE_IMAGE" -e LICENSE=accept -- 'id -u aceuser 2>/dev/null; id -g aceuser 2>/dev/null' | tail -n 2)"
-  local uid gid
-  uid="$(echo "$out" | head -n1 | tr -d '\r')"
-  gid="$(echo "$out" | tail -n1 | tr -d '\r')"
-  [[ "$uid" =~ ^[0-9]+$ ]] || uid=1000
-  [[ "$gid" =~ ^[0-9]+$ ]] || gid=0
-  printf '%s:%s\n' "$uid" "$gid"
-}
-
-init_ace_workdir_and_security() {
-  local wd="$1"
-  local pass_file="$2"
-
-  [[ -s "$pass_file" ]] || die "ACE password file missing/empty: $pass_file"
-  local pass
-  pass="$(cat "$pass_file")"
-
-  mkdir -p "$wd"
-  selinux_label_if_enforcing "$wd"
-
-  if ! ace_workdir_valid "$wd"; then
-    log "INFO" "ACE: initializing workdir via mqsicreateworkdir: $wd"
-    chmod 0777 "$wd" || true
-
-    docker_run_shell "$ACE_IMAGE" \
-      -e LICENSE=accept \
-      -v "${wd}:/workdir:Z" \
-      -- \
-      '
-        set -e
-        # Ensure ACE commands are available (try sourcing profile if needed)
-        if ! command -v mqsicreateworkdir >/dev/null 2>&1; then
-          for f in /opt/ibm/ace*/server/bin/mqsiprofile /opt/ibm/ace/server/bin/mqsiprofile; do
-            [ -f "$f" ] && . "$f" && break
-          done
-        fi
-        command -v mqsicreateworkdir >/dev/null 2>&1
-        mqsicreateworkdir /workdir
-        mkdir -p /workdir/overrides
-      '
-  else
-    log "INFO" "ACE: workdir already initialized: $wd"
-    mkdir -p "$wd/overrides" || true
-  fi
-
-  # Fix ownership/perms for the runtime container
-  local ids uid gid
-  ids="$(ace_get_uid_gid)"
-  uid="${ids%%:*}"
-  gid="${ids##*:}"
-  chown -R "${uid}:${gid}" "$wd" || true
-  chmod -R u+rwX,g+rwX "$wd" || true
-  find "$wd" -type d -exec chmod 2775 {} \; 2>/dev/null || true
-
-  log "INFO" "ACE: enabling Web UI auth + ensuring user '${ACE_WEB_USER}'"
-  docker_run_shell "$ACE_IMAGE" \
-    -e LICENSE=accept \
-    -e ACE_WEB_USER="${ACE_WEB_USER}" \
-    -e ACE_WEB_PASS="${pass}" \
-    -v "${wd}:/workdir:Z" \
-    -- \
-    '
-      set -e
-      if ! command -v mqsichangeauthmode >/dev/null 2>&1; then
-        for f in /opt/ibm/ace*/server/bin/mqsiprofile /opt/ibm/ace/server/bin/mqsiprofile; do
-          [ -f "$f" ] && . "$f" && break
-        done
-      fi
-      mkdir -p /workdir/overrides
-      mqsichangeauthmode -w /workdir -b active
-      ( mqsiwebuseradmin -w /workdir -c -u "$ACE_WEB_USER" -a "$ACE_WEB_PASS" ) \
-        || mqsiwebuseradmin -w /workdir -m -u "$ACE_WEB_USER" -a "$ACE_WEB_PASS"
-    '
-}
-
 main() {
   cleanup_old_logs
   need_cmd docker
   docker compose version >/dev/null 2>&1 || die "docker compose v2 not available."
-
   validate_port "$DP_WEBGUI_PORT" || die "DP_WEBGUI_PORT must be 1..65535 (got: $DP_WEBGUI_PORT)"
 
   log "INFO" "Project root: $PROJECT_ROOT"
@@ -265,7 +185,6 @@ main() {
   log "INFO" "  MQ : $MQ_IMAGE"
   log "INFO" "  ACE: $ACE_IMAGE"
   log "INFO" "  DP : $DP_IMAGE"
-  log "INFO" "DataPower WebGUI will listen on ${DP_WEBGUI_BIND}:${DP_WEBGUI_PORT} (container port ${DP_WEBGUI_PORT})"
 
   mkdir -p \
     "$PROJECT_ROOT/mq/data" \
@@ -287,12 +206,16 @@ main() {
   # Secrets
   ensure_secret_file "$PROJECT_ROOT/secrets/mqAdminPassword" "$(rand_pw)"
   ensure_secret_file "$PROJECT_ROOT/secrets/mqAppPassword"   "$(rand_pw)"
-  ensure_secret_file "$PROJECT_ROOT/$ACE_WEB_PASS_FILE"      "$(rand_pw)"
+  ensure_secret_file "$PROJECT_ROOT/secrets/aceWebAdminPassword" "$(rand_pw)"
 
-  log "INFO" "Pulling images..."
-  docker pull "$MQ_IMAGE"
-  docker pull "$ACE_IMAGE"
-  docker pull "$DP_IMAGE"
+  # Make MQ secret files readable for group 0 (MQ runs gid=0)
+  chgrp 0 "$PROJECT_ROOT/secrets/mqAdminPassword" "$PROJECT_ROOT/secrets/mqAppPassword" 2>/dev/null || true
+  chmod 0640 "$PROJECT_ROOT/secrets/mqAdminPassword" "$PROJECT_ROOT/secrets/mqAppPassword" 2>/dev/null || true
+
+  # Export MQ passwords for docker compose interpolation (THIS fixes MQ console login)
+  export MQ_ADMIN_PASSWORD MQ_APP_PASSWORD
+  MQ_ADMIN_PASSWORD="$(tr -d '\n' < "$PROJECT_ROOT/secrets/mqAdminPassword")"
+  MQ_APP_PASSWORD="$(tr -d '\n' < "$PROJECT_ROOT/secrets/mqAppPassword")"
 
   # MQSC
   backup_write "$PROJECT_ROOT/mq/mqsc/config.mqsc" "$(cat <<'EOF'
@@ -305,7 +228,7 @@ EOF
   chmod 0444 "$PROJECT_ROOT/mq/mqsc/config.mqsc" || true
   selinux_label_if_enforcing "$PROJECT_ROOT/mq/mqsc"
 
-  # DataPower startup
+  # DataPower startup config
   backup_write "$PROJECT_ROOT/datapower/config/auto-startup.cfg" "$(cat <<EOF
 top; configure terminal
 web-mgmt
@@ -323,12 +246,57 @@ EOF
   selinux_label_if_enforcing "$PROJECT_ROOT/datapower/local"
   selinux_label_if_enforcing "$PROJECT_ROOT/ace/workdir"
 
-  # ACE: init + security + user
-  init_ace_workdir_and_security \
-    "$PROJECT_ROOT/ace/workdir" \
-    "$PROJECT_ROOT/$ACE_WEB_PASS_FILE"
+  # Pull images now
+  log "INFO" "Pulling images..."
+  docker pull "$MQ_IMAGE"
+  docker pull "$ACE_IMAGE"
+  docker pull "$DP_IMAGE"
 
-  # .env
+  # ACE: init workdir + auth + web user (one-shot, no hang thanks to --entrypoint)
+  local ace_uidgid ace_uid ace_gid
+  ace_uidgid="$(ace_get_uid_gid)"
+  ace_uid="${ace_uidgid%%:*}"
+  ace_gid="${ace_uidgid##*:}"
+
+  mkdir -p "$PROJECT_ROOT/ace/workdir/overrides" || true
+  chown -R "${ace_uid}:${ace_gid}" "$PROJECT_ROOT/ace/workdir" 2>/dev/null || true
+  chmod -R u+rwX,g+rwX "$PROJECT_ROOT/ace/workdir" 2>/dev/null || true
+  find "$PROJECT_ROOT/ace/workdir" -type d -exec chmod 2775 {} \; 2>/dev/null || true
+
+  if ! ace_workdir_valid "$PROJECT_ROOT/ace/workdir"; then
+    log "INFO" "ACE: initializing workdir via mqsicreateworkdir"
+    docker_run_shell "$ACE_IMAGE" \
+      -e LICENSE=accept \
+      -v "${PROJECT_ROOT}/ace/workdir:/workdir:Z" \
+      -- \
+      '
+        set -e
+        mqsicreateworkdir /workdir
+        mkdir -p /workdir/overrides
+      '
+  else
+    log "INFO" "ACE: workdir already initialized"
+  fi
+
+  log "INFO" "ACE: enabling auth + ensuring web user ${ACE_WEB_USER}"
+  export ACE_WEB_PASSWORD
+  ACE_WEB_PASSWORD="$(tr -d '\n' < "$PROJECT_ROOT/secrets/aceWebAdminPassword")"
+
+  docker_run_shell "$ACE_IMAGE" \
+    -e LICENSE=accept \
+    -e ACE_WEB_USER="${ACE_WEB_USER}" \
+    -e ACE_WEB_PASSWORD="${ACE_WEB_PASSWORD}" \
+    -v "${PROJECT_ROOT}/ace/workdir:/workdir:Z" \
+    -- \
+    '
+      set -e
+      mkdir -p /workdir/overrides
+      mqsichangeauthmode -w /workdir -b active
+      ( mqsiwebuseradmin -w /workdir -c -u "$ACE_WEB_USER" -a "$ACE_WEB_PASSWORD" ) \
+        || mqsiwebuseradmin -w /workdir -m -u "$ACE_WEB_USER" -a "$ACE_WEB_PASSWORD"
+    '
+
+  # .env (no passwords)
   backup_write "$PROJECT_ROOT/.env" "$(cat <<EOF
 MQ_IMAGE=${MQ_IMAGE}
 ACE_IMAGE=${ACE_IMAGE}
@@ -345,7 +313,7 @@ DP_WEBGUI_PORT=${DP_WEBGUI_PORT}
 EOF
 )"
 
-  # compose
+  # docker-compose.yml
   backup_write "$PROJECT_ROOT/docker-compose.yml" "$(cat <<'EOF'
 services:
   mq:
@@ -356,6 +324,9 @@ services:
     environment:
       LICENSE: "accept"
       MQ_QMGR_NAME: "${MQ_QMGR_NAME:-QM1}"
+      MQ_CONNAUTH_USE_HTP: "true"
+      MQ_ADMIN_PASSWORD: "${MQ_ADMIN_PASSWORD}"
+      MQ_APP_PASSWORD: "${MQ_APP_PASSWORD}"
     ulimits:
       nofile:
         soft: ${NOFILE_SOFT:-10240}
@@ -425,20 +396,14 @@ EOF
   docker compose up -d
   docker compose ps
 
-  log "INFO" "MQ last lines:"
-  docker logs --tail=80 mq || true
-
-  log "INFO" "ACE last lines:"
-  docker logs --tail=120 ace || true
-
+  log "INFO" "MQ Web Console: https://localhost:9443/ibmmq/console/"
+  log "INFO" "MQ login: admin / $(cat "$PROJECT_ROOT/secrets/mqAdminPassword")"
+  log "INFO" "ACE Web UI: http://localhost:7600  (czasem https://localhost:7843)"
+  log "INFO" "ACE login: ${ACE_WEB_USER} / $(cat "$PROJECT_ROOT/secrets/aceWebAdminPassword")"
+  log "INFO" "DataPower WebGUI: https://localhost:${DP_WEBGUI_PORT}"
   log "INFO" "Done."
-  log "INFO" "ACE Web UI:  http://localhost:7600  (czasem https://localhost:7843)"
-  log "INFO" "ACE user:    ${ACE_WEB_USER}"
-  log "INFO" "ACE pass:    $(cat "$ACE_WEB_PASS_FILE" 2>/dev/null || true)"
-  log "INFO" "DP WebGUI:   https://localhost:${DP_WEBGUI_PORT}"
 
   popd >/dev/null
 }
 
 main "$@"
-
