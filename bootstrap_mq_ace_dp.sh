@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ---------------------------------------------------------------------
-# bootstrap_mq_ace_dp.sh
-# Fixes IBM MQ container startup:
-#  - set ulimit nofile >= 10240 (MQ recommended minimum)
-#  - use secrets for passwords (mqAdminPassword/mqAppPassword)
-#  - mount MQSC as /etc/mqm/config.mqsc (do NOT mask /etc/mqm directory)
-#  - --fresh wipes QM data (recommended if "qmgr damaged")
-# ---------------------------------------------------------------------
-
 PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)/mq-ace-dp}"
 FRESH=0
 DEBUG="${DEBUG:-0}"
@@ -112,7 +103,6 @@ selinux_label_if_enforcing() {
 fix_mq_data_perms() {
   local dir="$1"
   mkdir -p "$dir"
-  # MQ container runs as UID 1001, group 0
   chown -R 1001:0 "$dir" || true
   chmod -R u+rwX,g+rwX "$dir" || true
   chmod 2775 "$dir" || true
@@ -146,11 +136,9 @@ main() {
       "$PROJECT_ROOT/datapower/local/"* || true
   fi
 
-  # Secrets for MQ passwords
   ensure_secret_file "$PROJECT_ROOT/secrets/mqAdminPassword" "$(rand_pw)"
   ensure_secret_file "$PROJECT_ROOT/secrets/mqAppPassword"   "$(rand_pw)"
 
-  # MQSC autoconfig file (IBM MQ reads /etc/mqm/config.mqsc on start)
   backup_write "$PROJECT_ROOT/mq/mqsc/config.mqsc" "$(cat <<'EOF'
 * Minimal MQ bootstrap configuration
 DEFINE QLOCAL('Q1') REPLACE
@@ -159,11 +147,9 @@ SET CHLAUTH('DEV.APP.SVRCONN') TYPE(BLOCKUSER) USERLIST('nobody') ACTION(REPLACE
 EOF
 )"
 
-  # Fix bind-mount perms + SELinux label if needed
   fix_mq_data_perms "$PROJECT_ROOT/mq/data"
   selinux_label_if_enforcing "$PROJECT_ROOT/mq/data"
 
-  # .env for compose
   backup_write "$PROJECT_ROOT/.env" "$(cat <<EOF
 MQ_IMAGE=${MQ_IMAGE}
 ACE_IMAGE=${ACE_IMAGE}
@@ -175,7 +161,6 @@ NOFILE_HARD=${NOFILE_HARD}
 EOF
 )"
 
-  # docker-compose.yml with ulimits + secrets + correct MQSC mount
   backup_write "$PROJECT_ROOT/docker-compose.yml" "$(cat <<'EOF'
 services:
   mq:
