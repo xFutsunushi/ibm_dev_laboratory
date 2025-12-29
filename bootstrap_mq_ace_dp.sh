@@ -214,7 +214,6 @@ services:
     ports:
       - "9090:9090"
       - "5550:5550"
-      - "8443:8443"
     volumes:
       - ./datapower/config:/opt/ibm/datapower/drouter/config:Z
       - ./datapower/local:/opt/ibm/datapower/drouter/local:Z
