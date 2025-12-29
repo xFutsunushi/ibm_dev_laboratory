@@ -9,7 +9,7 @@ You will:
 1. Confirm containers are running
 2. Confirm MQ queue manager is running and `Q1` exists
 3. Put a test message to `Q1` and browse it in MQ
-4. (Optional) Create a simple ACE HTTP check endpoint (quick dev-only approach)
+4. (Optional) Quick ACE checks (dev-only)
 5. (Optional) Put DataPower in front of ACE (concept + quick checks)
 
 > Assumptions:
@@ -38,13 +38,13 @@ Quick port check from your workstation (optional):
 
 ```bash
 # MQ Console (HTTPS)
-curl -kI https://docker.local:9443/ || true
+curl -kI https://docker.local:9443/ibmmq/console/ || true
 
 # ACE UI
 curl -I http://docker.local:7600/ || true
 
-# DataPower (may differ by configuration)
-curl -I http://docker.local:9090/ || true
+# DataPower WebGUI (this lab maps it to HTTPS on 9090)
+curl -kI https://docker.local:9090/ || true
 ```
 
 ---
@@ -76,9 +76,9 @@ Expected: definition of `Q1` displayed.
 If it does not exist, your `mq/mqsc/config.mqsc` was not applied. Most common causes:
 
 * the file wasn’t mounted to `/etc/mqm/config.mqsc`
-* the queue manager data directory is not clean and MQ skipped initialization
+* the MQ data directory is not clean and MQ skipped initialization
 
-Fix (dev):
+Fix (dev reset):
 
 ```bash
 cd mq-ace-dp
@@ -115,7 +115,7 @@ Type a line, press Enter, then press Enter again on an empty line to finish.
 
 Open:
 
-* **MQ Console:** `https://docker.local:9443/`
+* **MQ Console:** `https://docker.local:9443/ibmmq/console/`
 
 Then:
 
@@ -136,16 +136,7 @@ ACE’s web UI should be reachable:
 
 This step only verifies the runtime/UI is up.
 
-### (Optional) Quick “health endpoint” approach
-
-ACE is normally used with Toolkit + BAR deployments.
-
-For a fast lab check, keep it simple:
-
-* confirm the container is alive
-* later you will deploy a real BAR
-
-Basic container check:
+### Optional: quick container check
 
 ```bash
 docker exec -it ace bash -lc 'uname -a; id; ls -la'
@@ -199,7 +190,7 @@ docker logs --tail=80 datapower
 docker exec -it datapower sh -lc 'getent hosts ace || true'
 ```
 
-3. Confirm ACE port is reachable from DataPower (if shell is available):
+3. Confirm ACE port is reachable from DataPower (if shell/tools are available):
 
 ```bash
 # This may not work on all DP images depending on available shell/tools.
@@ -270,4 +261,4 @@ Create a tiny ACE flow:
 Then put DataPower in front of ACE:
 
 * DataPower front URL → forwards to ACE `/ping`
-* Add basic policy (allowlist, rate-limit)
+* Add a basic policy (allowlist, rate-limit)
