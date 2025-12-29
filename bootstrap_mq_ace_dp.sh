@@ -1,18 +1,38 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# ---------------------------------------------------------------------
+# bootstrap_mq_ace_dp.sh
+# Fixes IBM MQ container startup:
+#  - set ulimit nofile >= 10240 (MQ recommended minimum)
+#  - use secrets for passwords (mqAdminPassword/mqAppPassword)
+#  - mount MQSC as /etc/mqm/config.mqsc (do NOT mask /etc/mqm directory)
+#  - --fresh wipes QM data (recommended if "qmgr damaged")
+#
+# Also enables DataPower WebGUI (web-mgmt) via auto-startup.cfg:
+#  - web-mgmt admin-state enabled
+#  - local-address 0.0.0.0:9090
+# ---------------------------------------------------------------------
+
+trap 'echo "[FATAL] Unhandled error on line ${LINENO} (exit code $?)" >&2' ERR
+
 PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)/mq-ace-dp}"
 FRESH=0
 DEBUG="${DEBUG:-0}"
 
-# Pinned MQ tag (exists in IBM registry) — change if you want
+# Images
 MQ_IMAGE="${MQ_IMAGE:-icr.io/ibm-messaging/mq:9.3.5.1-r2}"
 ACE_IMAGE="${ACE_IMAGE:-ibmcom/ace:latest}"
 DP_IMAGE="${DP_IMAGE:-icr.io/cpopen/datapower/datapower-limited:10.5.0.2}"
 
+# MQ
 MQ_QMGR_NAME="${MQ_QMGR_NAME:-QM1}"
 NOFILE_SOFT="${NOFILE_SOFT:-10240}"
 NOFILE_HARD="${NOFILE_HARD:-10240}"
+
+# DataPower WebGUI
+DP_WEBGUI_BIND="${DP_WEBGUI_BIND:-0.0.0.0}"
+DP_WEBGUI_PORT="${DP_WEBGUI_PORT:-9090}"
 
 usage() {
   cat <<EOF
@@ -25,6 +45,7 @@ Usage: $0 [--fresh] [--project-root PATH] [--debug]
 Env overrides:
   PROJECT_ROOT, MQ_IMAGE, ACE_IMAGE, DP_IMAGE, MQ_QMGR_NAME
   NOFILE_SOFT, NOFILE_HARD
+  DP_WEBGUI_BIND, DP_WEBGUI_PORT
 EOF
 }
 
@@ -103,9 +124,17 @@ selinux_label_if_enforcing() {
 fix_mq_data_perms() {
   local dir="$1"
   mkdir -p "$dir"
+  # MQ container runs as UID 1001, group 0
   chown -R 1001:0 "$dir" || true
   chmod -R u+rwX,g+rwX "$dir" || true
   chmod 2775 "$dir" || true
+}
+
+validate_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  (( p >= 1 && p <= 65535 )) || return 1
+  return 0
 }
 
 main() {
@@ -113,11 +142,14 @@ main() {
   need_cmd docker
   docker compose version >/dev/null 2>&1 || die "docker compose v2 not available."
 
+  validate_port "$DP_WEBGUI_PORT" || die "DP_WEBGUI_PORT must be 1..65535 (got: $DP_WEBGUI_PORT)"
+
   log "INFO" "Project root: $PROJECT_ROOT"
   log "INFO" "Using images:"
   log "INFO" "  MQ : $MQ_IMAGE"
   log "INFO" "  ACE: $ACE_IMAGE"
   log "INFO" "  DP : $DP_IMAGE"
+  log "INFO" "DataPower WebGUI will listen on ${DP_WEBGUI_BIND}:${DP_WEBGUI_PORT} (container port ${DP_WEBGUI_PORT})"
 
   mkdir -p \
     "$PROJECT_ROOT/mq/data" \
@@ -136,9 +168,11 @@ main() {
       "$PROJECT_ROOT/datapower/local/"* || true
   fi
 
+  # Secrets for MQ passwords
   ensure_secret_file "$PROJECT_ROOT/secrets/mqAdminPassword" "$(rand_pw)"
   ensure_secret_file "$PROJECT_ROOT/secrets/mqAppPassword"   "$(rand_pw)"
 
+  # MQSC autoconfig file (IBM MQ reads /etc/mqm/config.mqsc on start)
   backup_write "$PROJECT_ROOT/mq/mqsc/config.mqsc" "$(cat <<'EOF'
 * Minimal MQ bootstrap configuration
 DEFINE QLOCAL('Q1') REPLACE
@@ -147,9 +181,26 @@ SET CHLAUTH('DEV.APP.SVRCONN') TYPE(BLOCKUSER) USERLIST('nobody') ACTION(REPLACE
 EOF
 )"
 
+  # DataPower: enable WebGUI via startup config (auto-startup.cfg)
+  # NOTE: binds to all interfaces (0.0.0.0) -> OK for local dev, risky in prod.
+  backup_write "$PROJECT_ROOT/datapower/config/auto-startup.cfg" "$(cat <<EOF
+top; configure terminal
+web-mgmt
+  admin-state enabled
+  local-address ${DP_WEBGUI_BIND} ${DP_WEBGUI_PORT}
+exit
+write memory
+EOF
+)"
+
+  # Fix bind-mount perms + SELinux label if needed
   fix_mq_data_perms "$PROJECT_ROOT/mq/data"
   selinux_label_if_enforcing "$PROJECT_ROOT/mq/data"
+  selinux_label_if_enforcing "$PROJECT_ROOT/datapower/config"
+  selinux_label_if_enforcing "$PROJECT_ROOT/datapower/local"
+  selinux_label_if_enforcing "$PROJECT_ROOT/ace/workdir"
 
+  # .env for compose
   backup_write "$PROJECT_ROOT/.env" "$(cat <<EOF
 MQ_IMAGE=${MQ_IMAGE}
 ACE_IMAGE=${ACE_IMAGE}
@@ -158,9 +209,13 @@ DP_IMAGE=${DP_IMAGE}
 MQ_QMGR_NAME=${MQ_QMGR_NAME}
 NOFILE_SOFT=${NOFILE_SOFT}
 NOFILE_HARD=${NOFILE_HARD}
+
+DP_WEBGUI_BIND=${DP_WEBGUI_BIND}
+DP_WEBGUI_PORT=${DP_WEBGUI_PORT}
 EOF
 )"
 
+  # docker-compose.yml with ulimits + secrets + correct MQSC mount
   backup_write "$PROJECT_ROOT/docker-compose.yml" "$(cat <<'EOF'
 services:
   mq:
@@ -212,8 +267,9 @@ services:
       DATAPOWER_LOG_STDOUT: "true"
       DATAPOWER_FAST_STARTUP: "true"
     ports:
-      - "9090:9090"
+      - "${DP_WEBGUI_PORT:-9090}:${DP_WEBGUI_PORT:-9090}"
       - "5550:5550"
+      - "9444:9443"
     volumes:
       - ./datapower/config:/opt/ibm/datapower/drouter/config:Z
       - ./datapower/local:/opt/ibm/datapower/drouter/local:Z
@@ -245,13 +301,17 @@ EOF
   docker compose ps
 
   log "INFO" "Verifying MQ ulimit inside container:"
-  docker exec mq sh -lc 'ulimit -n'
+  docker exec mq sh -lc 'ulimit -n' || true
 
   log "INFO" "MQ last lines:"
   docker logs --tail=60 mq || true
 
-  log "INFO" "Done. If MQ is up, this should show QM state:"
-  log "INFO" "  docker exec -it mq dspmq"
+  log "INFO" "DataPower: check if WebGUI port is listening (inside container):"
+  docker exec datapower sh -lc "netstat -tlnp 2>/dev/null | grep -E ':(9090|${DP_WEBGUI_PORT})' || ss -tlnp | grep -E ':(9090|${DP_WEBGUI_PORT})' || true" || true
+
+  log "INFO" "Done."
+  log "INFO" "DataPower WebGUI: https://localhost:${DP_WEBGUI_PORT}"
+  log "INFO" "If login fails, remember: in dev images it's often admin/admin (you may be forced to change it)."
 
   popd >/dev/null
 }
