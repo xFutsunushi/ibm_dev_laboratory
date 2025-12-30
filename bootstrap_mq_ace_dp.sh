@@ -3,9 +3,15 @@ set -Eeuo pipefail
 
 trap 'echo "[FATAL] Unhandled error on line ${LINENO} (exit code $?)" >&2' ERR
 
+# ---------------------------
+# Config / defaults
+# ---------------------------
 PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)/mq-ace-dp}"
 FRESH=0
 DEBUG="${DEBUG:-0}"
+
+# If you run as root and want files owned by a normal user:
+PROJECT_OWNER="${PROJECT_OWNER:-${SUDO_USER:-${USER}}}"
 
 # Images
 MQ_IMAGE="${MQ_IMAGE:-icr.io/ibm-messaging/mq:9.3.5.1-r2}"
@@ -17,6 +23,10 @@ MQ_QMGR_NAME="${MQ_QMGR_NAME:-QM1}"
 NOFILE_SOFT="${NOFILE_SOFT:-10240}"
 NOFILE_HARD="${NOFILE_HARD:-10240}"
 
+# IMPORTANT (dev-first): wide perms to prove storage/perms are not the cause.
+# After stable start, you can set MQDATA_PERMS=2775 (or similar) and rerun --refresh.
+MQDATA_PERMS="${MQDATA_PERMS:-0777}"
+
 # ACE Web UI user
 ACE_WEB_USER="${ACE_WEB_USER:-Admin}"
 
@@ -27,17 +37,21 @@ DP_WEBGUI_PORT="${DP_WEBGUI_PORT:-9090}"
 # Optional timeout for one-shot docker runs (seconds); 0 disables
 DOCKER_RUN_TIMEOUT="${DOCKER_RUN_TIMEOUT:-180}"
 
+# Volume name prefix (sanitized)
+STACK_NAME="${STACK_NAME:-$(basename "$PROJECT_ROOT")}"
+
 usage() {
   cat <<EOF
 Usage: $0 [--fresh|--refresh] [--project-root PATH] [--debug]
 
-  --fresh/--refresh  Wipe MQ/ACE/DP dirs before start
+  --fresh/--refresh  Wipe named volumes (MQ/ACE/DP persisted data) before start
   --project-root     Project directory (default: ${PROJECT_ROOT})
   --debug            Enable bash xtrace
 
 Env overrides:
-  PROJECT_ROOT, MQ_IMAGE, ACE_IMAGE, DP_IMAGE, MQ_QMGR_NAME
-  NOFILE_SOFT, NOFILE_HARD
+  PROJECT_ROOT, PROJECT_OWNER, STACK_NAME
+  MQ_IMAGE, ACE_IMAGE, DP_IMAGE, MQ_QMGR_NAME
+  NOFILE_SOFT, NOFILE_HARD, MQDATA_PERMS
   ACE_WEB_USER
   DP_WEBGUI_BIND, DP_WEBGUI_PORT
   DOCKER_RUN_TIMEOUT
@@ -105,26 +119,6 @@ backup_write() {
   log "INFO" "Wrote: $path"
 }
 
-selinux_label_if_enforcing() {
-  local path="$1"
-  if command -v getenforce >/dev/null 2>&1; then
-    local mode
-    mode="$(getenforce || true)"
-    if [[ "$mode" == "Enforcing" ]] && command -v chcon >/dev/null 2>&1; then
-      chcon -Rt container_file_t "$path" || true
-      log "INFO" "SELinux: labeled $path as container_file_t"
-    fi
-  fi
-}
-
-fix_mq_data_perms() {
-  local dir="$1"
-  mkdir -p "$dir"
-  chown -R 1001:0 "$dir" || true
-  chmod -R u+rwX,g+rwX "$dir" || true
-  chmod 2775 "$dir" || true
-}
-
 validate_port() {
   local p="$1"
   [[ "$p" =~ ^[0-9]+$ ]] || return 1
@@ -151,12 +145,30 @@ docker_run_shell() {
   shift
   local cmd="$*"
 
-  # prefer bash, fallback to sh
   if run_timeout docker run --rm --entrypoint bash "${args[@]}" "$image" -lc 'true' >/dev/null 2>&1; then
     run_timeout docker run --rm --entrypoint bash "${args[@]}" "$image" -lc "$cmd"
   else
-    run_timeout docker run --rm --entrypoint sh "${args[@]}" "$image" -lc "$cmd"
+    run_timeout docker run --rm --entrypoint sh "${args[@]}" "$image" -c "$cmd"
   fi
+}
+
+docker_shell_for_image() {
+  local image="$1"
+  if run_timeout docker run --rm --entrypoint bash "$image" -lc 'true' >/dev/null 2>&1; then
+    echo "bash"
+  else
+    echo "sh"
+  fi
+}
+
+ensure_volume() {
+  local vol="$1"
+  docker volume inspect "$vol" >/dev/null 2>&1 || docker volume create "$vol" >/dev/null
+}
+
+wipe_volume() {
+  local vol="$1"
+  docker volume rm -f "$vol" >/dev/null 2>&1 || true
 }
 
 ace_get_uid_gid() {
@@ -169,9 +181,67 @@ ace_get_uid_gid() {
   printf "%s:%s" "$uid" "$gid"
 }
 
-ace_workdir_valid() {
-  local wd="$1"
-  [[ -d "$wd/config/common" ]]
+ace_volume_valid() {
+  local vol="$1"
+  docker_run_shell "$ACE_IMAGE" -e LICENSE=accept -v "${vol}:/workdir" -- 'test -d /workdir/config/common'
+}
+
+fix_project_ownership_if_root() {
+  if [[ "${EUID}" -eq 0 ]] && [[ -n "${PROJECT_OWNER}" ]] && id "${PROJECT_OWNER}" >/dev/null 2>&1; then
+    chown -R "${PROJECT_OWNER}:${PROJECT_OWNER}" "$PROJECT_ROOT" 2>/dev/null || true
+  fi
+}
+
+warn_if_docker_root_nosuid() {
+  command -v findmnt >/dev/null 2>&1 || return 0
+  local rootdir opts
+  rootdir="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)"
+  [[ -n "$rootdir" ]] || return 0
+  opts="$(findmnt -no OPTIONS "$rootdir" 2>/dev/null || true)"
+  if [[ "$opts" == *nosuid* ]]; then
+    log "WARN" "DockerRootDir ($rootdir) is mounted with 'nosuid' ($opts). MQ can fail hard with internal errors on such setups."
+  fi
+}
+
+dump_mq_diagnostics_from_volume() {
+  local mqdata_vol="$1"
+  log "INFO" "Dumping MQ diagnostics (FDC + logs) from volume: $mqdata_vol"
+  docker_run_shell "$MQ_IMAGE" -u 0:0 -v "${mqdata_vol}:/mnt/mqm" -- '
+    set -e
+    ERR=/mnt/mqm/data/errors
+    echo "== ls -ltr ${ERR} (tail) =="
+    ls -ltr "$ERR" 2>/dev/null | tail -n 80 || true
+    echo
+    echo "== AMQERR01.LOG (tail) =="
+    tail -n 200 "$ERR/AMQERR01.LOG" 2>/dev/null || true
+    echo
+    latest="$(ls -1t "$ERR"/*.FDC 2>/dev/null | head -n 1 || true)"
+    if [ -n "$latest" ]; then
+      echo "== LATEST FDC: $latest =="
+      egrep -n "Probe Id|Component|Program Name|Probe Description|Major Errorcode|Minor Errorcode|Comment|errno|File|Line Number|Call" "$latest" | head -n 260 || true
+      echo
+      echo "== FDC (head 220) =="
+      sed -n "1,220p" "$latest" 2>/dev/null || true
+    else
+      echo "No FDC files found in $ERR"
+    fi
+  ' || true
+}
+
+wait_for_mq() {
+  local qm="$1"
+  local tries="${2:-60}"
+  local sleep_s="${3:-2}"
+
+  log "INFO" "Waiting for MQ queue manager to reach RUNNING: ${qm}"
+  for ((i=1; i<=tries; i++)); do
+    if docker exec mq bash -lc "dspmq -m ${qm} 2>/dev/null | grep -iq RUNNING" >/dev/null 2>&1; then
+      log "INFO" "MQ is RUNNING (attempt ${i}/${tries})"
+      return 0
+    fi
+    sleep "$sleep_s"
+  done
+  return 1
 }
 
 main() {
@@ -180,56 +250,58 @@ main() {
   docker compose version >/dev/null 2>&1 || die "docker compose v2 not available."
   validate_port "$DP_WEBGUI_PORT" || die "DP_WEBGUI_PORT must be 1..65535 (got: $DP_WEBGUI_PORT)"
 
+  # sanitize stack name
+  STACK_NAME="$(echo "$STACK_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g')"
+
+  local MQDATA_VOL ACEWORK_VOL DPCONFIG_VOL DPLOCAL_VOL DPTMP_VOL
+  MQDATA_VOL="${MQDATA_VOL:-${STACK_NAME}_mqdata}"
+  ACEWORK_VOL="${ACEWORK_VOL:-${STACK_NAME}_acework}"
+  DPCONFIG_VOL="${DPCONFIG_VOL:-${STACK_NAME}_dpconfig}"
+  DPLOCAL_VOL="${DPLOCAL_VOL:-${STACK_NAME}_dplocal}"
+  DPTMP_VOL="${DPTMP_VOL:-${STACK_NAME}_dptmp}"
+
   log "INFO" "Project root: $PROJECT_ROOT"
+  log "INFO" "Stack name : $STACK_NAME"
   log "INFO" "Using images:"
   log "INFO" "  MQ : $MQ_IMAGE"
   log "INFO" "  ACE: $ACE_IMAGE"
   log "INFO" "  DP : $DP_IMAGE"
+  log "INFO" "Volumes:"
+  log "INFO" "  MQ data  : $MQDATA_VOL"
+  log "INFO" "  ACE work : $ACEWORK_VOL"
+  log "INFO" "  DP config: $DPCONFIG_VOL"
+  log "INFO" "  DP local : $DPLOCAL_VOL"
+  log "INFO" "  DP temp  : $DPTMP_VOL"
 
   mkdir -p \
-    "$PROJECT_ROOT/mq/data" \
+    "$PROJECT_ROOT/secrets" \
+    "$PROJECT_ROOT/logs" \
     "$PROJECT_ROOT/mq/mqsc" \
-    "$PROJECT_ROOT/ace/workdir" \
-    "$PROJECT_ROOT/datapower/config" \
-    "$PROJECT_ROOT/datapower/local" \
-    "$PROJECT_ROOT/secrets"
-
-  if [[ "$FRESH" == "1" ]]; then
-    log "INFO" "--fresh: wiping persisted data"
-    rm -rf \
-      "$PROJECT_ROOT/mq/data/"* \
-      "$PROJECT_ROOT/ace/workdir/"* \
-      "$PROJECT_ROOT/datapower/config/"* \
-      "$PROJECT_ROOT/datapower/local/"* || true
-  fi
+    "$PROJECT_ROOT/datapower/config"
 
   # Secrets
   ensure_secret_file "$PROJECT_ROOT/secrets/mqAdminPassword" "$(rand_pw)"
   ensure_secret_file "$PROJECT_ROOT/secrets/mqAppPassword"   "$(rand_pw)"
   ensure_secret_file "$PROJECT_ROOT/secrets/aceWebAdminPassword" "$(rand_pw)"
 
-  # Make MQ secret files readable for group 0 (MQ runs gid=0)
-  chgrp 0 "$PROJECT_ROOT/secrets/mqAdminPassword" "$PROJECT_ROOT/secrets/mqAppPassword" 2>/dev/null || true
-  chmod 0640 "$PROJECT_ROOT/secrets/mqAdminPassword" "$PROJECT_ROOT/secrets/mqAppPassword" 2>/dev/null || true
-
-  # Export MQ passwords for docker compose interpolation (THIS fixes MQ console login)
-  export MQ_ADMIN_PASSWORD MQ_APP_PASSWORD
+  # Export passwords for compose interpolation
+  export MQ_ADMIN_PASSWORD MQ_APP_PASSWORD ACE_WEB_PASSWORD
   MQ_ADMIN_PASSWORD="$(tr -d '\n' < "$PROJECT_ROOT/secrets/mqAdminPassword")"
   MQ_APP_PASSWORD="$(tr -d '\n' < "$PROJECT_ROOT/secrets/mqAppPassword")"
+  ACE_WEB_PASSWORD="$(tr -d '\n' < "$PROJECT_ROOT/secrets/aceWebAdminPassword")"
 
-  # MQSC
-  backup_write "$PROJECT_ROOT/mq/mqsc/config.mqsc" "$(cat <<'EOF'
+  # Template contents (kept in project for backup/history)
+  local MQSC_CONTENT DP_STARTUP_CONTENT
+  MQSC_CONTENT="$(cat <<'EOF'
 * Minimal MQ bootstrap configuration
 DEFINE QLOCAL('Q1') REPLACE
 DEFINE CHANNEL('DEV.APP.SVRCONN') CHLTYPE(SVRCONN) REPLACE
 SET CHLAUTH('DEV.APP.SVRCONN') TYPE(BLOCKUSER) USERLIST('nobody') ACTION(REPLACE)
 EOF
 )"
-  chmod 0444 "$PROJECT_ROOT/mq/mqsc/config.mqsc" || true
-  selinux_label_if_enforcing "$PROJECT_ROOT/mq/mqsc"
 
-  # DataPower startup config
-  backup_write "$PROJECT_ROOT/datapower/config/auto-startup.cfg" "$(cat <<EOF
+  # DataPower web-mgmt: syntax is "local-address <address> <port>"
+  DP_STARTUP_CONTENT="$(cat <<EOF
 top; configure terminal
 web-mgmt
   admin-state enabled
@@ -239,65 +311,28 @@ write memory
 EOF
 )"
 
-  # Perms/labels
-  fix_mq_data_perms "$PROJECT_ROOT/mq/data"
-  selinux_label_if_enforcing "$PROJECT_ROOT/mq/data"
-  selinux_label_if_enforcing "$PROJECT_ROOT/datapower/config"
-  selinux_label_if_enforcing "$PROJECT_ROOT/datapower/local"
-  selinux_label_if_enforcing "$PROJECT_ROOT/ace/workdir"
+  # IMPORTANT: MQ container runs MQSC scripts found under /etc/mqm at queue manager creation.
+  # Use a numbered file to keep ordering predictable.
+  backup_write "$PROJECT_ROOT/mq/mqsc/20-config.mqsc" "$MQSC_CONTENT"
+  backup_write "$PROJECT_ROOT/datapower/config/auto-startup.cfg" "$DP_STARTUP_CONTENT"
 
-  # Pull images now
   log "INFO" "Pulling images..."
   docker pull "$MQ_IMAGE"
   docker pull "$ACE_IMAGE"
   docker pull "$DP_IMAGE"
 
-  # ACE: init workdir + auth + web user (one-shot, no hang thanks to --entrypoint)
+  warn_if_docker_root_nosuid
+
+  # Determine ACE uid/gid (for volume ownership)
   local ace_uidgid ace_uid ace_gid
   ace_uidgid="$(ace_get_uid_gid)"
   ace_uid="${ace_uidgid%%:*}"
   ace_gid="${ace_uidgid##*:}"
 
-  mkdir -p "$PROJECT_ROOT/ace/workdir/overrides" || true
-  chown -R "${ace_uid}:${ace_gid}" "$PROJECT_ROOT/ace/workdir" 2>/dev/null || true
-  chmod -R u+rwX,g+rwX "$PROJECT_ROOT/ace/workdir" 2>/dev/null || true
-  find "$PROJECT_ROOT/ace/workdir" -type d -exec chmod 2775 {} \; 2>/dev/null || true
-
-  if ! ace_workdir_valid "$PROJECT_ROOT/ace/workdir"; then
-    log "INFO" "ACE: initializing workdir via mqsicreateworkdir"
-    docker_run_shell "$ACE_IMAGE" \
-      -e LICENSE=accept \
-      -v "${PROJECT_ROOT}/ace/workdir:/workdir:Z" \
-      -- \
-      '
-        set -e
-        mqsicreateworkdir /workdir
-        mkdir -p /workdir/overrides
-      '
-  else
-    log "INFO" "ACE: workdir already initialized"
-  fi
-
-  log "INFO" "ACE: enabling auth + ensuring web user ${ACE_WEB_USER}"
-  export ACE_WEB_PASSWORD
-  ACE_WEB_PASSWORD="$(tr -d '\n' < "$PROJECT_ROOT/secrets/aceWebAdminPassword")"
-
-  docker_run_shell "$ACE_IMAGE" \
-    -e LICENSE=accept \
-    -e ACE_WEB_USER="${ACE_WEB_USER}" \
-    -e ACE_WEB_PASSWORD="${ACE_WEB_PASSWORD}" \
-    -v "${PROJECT_ROOT}/ace/workdir:/workdir:Z" \
-    -- \
-    '
-      set -e
-      mkdir -p /workdir/overrides
-      mqsichangeauthmode -w /workdir -b active
-      ( mqsiwebuseradmin -w /workdir -c -u "$ACE_WEB_USER" -a "$ACE_WEB_PASSWORD" ) \
-        || mqsiwebuseradmin -w /workdir -m -u "$ACE_WEB_USER" -a "$ACE_WEB_PASSWORD"
-    '
-
   # .env (no passwords)
   backup_write "$PROJECT_ROOT/.env" "$(cat <<EOF
+STACK_NAME=${STACK_NAME}
+
 MQ_IMAGE=${MQ_IMAGE}
 ACE_IMAGE=${ACE_IMAGE}
 DP_IMAGE=${DP_IMAGE}
@@ -305,11 +340,18 @@ DP_IMAGE=${DP_IMAGE}
 MQ_QMGR_NAME=${MQ_QMGR_NAME}
 NOFILE_SOFT=${NOFILE_SOFT}
 NOFILE_HARD=${NOFILE_HARD}
+MQDATA_PERMS=${MQDATA_PERMS}
 
 ACE_WEB_USER=${ACE_WEB_USER}
 
 DP_WEBGUI_BIND=${DP_WEBGUI_BIND}
 DP_WEBGUI_PORT=${DP_WEBGUI_PORT}
+
+MQDATA_VOL=${MQDATA_VOL}
+ACEWORK_VOL=${ACEWORK_VOL}
+DPCONFIG_VOL=${DPCONFIG_VOL}
+DPLOCAL_VOL=${DPLOCAL_VOL}
+DPTMP_VOL=${DPTMP_VOL}
 EOF
 )"
 
@@ -335,11 +377,8 @@ services:
       - "1414:1414"
       - "9443:9443"
     volumes:
-      - ./mq/data:/mnt/mqm:Z
-      - ./mq/mqsc/config.mqsc:/etc/mqm/config.mqsc:ro,Z
-    secrets:
-      - mqAdminPassword
-      - mqAppPassword
+      - mqdata:/mnt/mqm
+      - ./mq/mqsc/20-config.mqsc:/etc/mqm/20-config.mqsc:ro
     networks: [ibmnet]
 
   ace:
@@ -355,7 +394,7 @@ services:
       - "7800:7800"
       - "7843:7843"
     volumes:
-      - ./ace/workdir:/home/aceuser/ace-server:Z
+      - acework:/home/aceuser/ace-server
     networks: [ibmnet]
 
   datapower:
@@ -372,15 +411,27 @@ services:
       - "5550:5550"
       - "9444:9443"
     volumes:
-      - ./datapower/config:/opt/ibm/datapower/drouter/config:Z
-      - ./datapower/local:/opt/ibm/datapower/drouter/local:Z
+      - dpconfig:/opt/ibm/datapower/drouter/config
+      - dplocal:/opt/ibm/datapower/drouter/local
+      - dptmp:/opt/ibm/datapower/drouter/temporary
     networks: [ibmnet]
 
-secrets:
-  mqAdminPassword:
-    file: ./secrets/mqAdminPassword
-  mqAppPassword:
-    file: ./secrets/mqAppPassword
+volumes:
+  mqdata:
+    external: true
+    name: "${MQDATA_VOL}"
+  acework:
+    external: true
+    name: "${ACEWORK_VOL}"
+  dpconfig:
+    external: true
+    name: "${DPCONFIG_VOL}"
+  dplocal:
+    external: true
+    name: "${DPLOCAL_VOL}"
+  dptmp:
+    external: true
+    name: "${DPTMP_VOL}"
 
 networks:
   ibmnet:
@@ -391,19 +442,124 @@ EOF
   pushd "$PROJECT_ROOT" >/dev/null
   set -a; source ./.env; set +a
 
-  log "INFO" "Restarting stack..."
+  log "INFO" "Stopping stack..."
   docker compose down >/dev/null 2>&1 || true
-  docker compose up -d
+
+  if [[ "$FRESH" == "1" ]]; then
+    log "INFO" "--refresh: wiping named volumes"
+    wipe_volume "$MQDATA_VOL"
+    wipe_volume "$ACEWORK_VOL"
+    wipe_volume "$DPCONFIG_VOL"
+    wipe_volume "$DPLOCAL_VOL"
+    wipe_volume "$DPTMP_VOL"
+  fi
+
+  ensure_volume "$MQDATA_VOL"
+  ensure_volume "$ACEWORK_VOL"
+  ensure_volume "$DPCONFIG_VOL"
+  ensure_volume "$DPLOCAL_VOL"
+  ensure_volume "$DPTMP_VOL"
+
+  # ---------------------------
+  # MQ volume perms (DEV-FIRST)
+  # ---------------------------
+  log "INFO" "MQ: initializing /mnt/mqm volume permissions (UID 1001), mode ${MQDATA_PERMS} ..."
+  docker_run_shell "$MQ_IMAGE" \
+    -u 0:0 \
+    -v "${MQDATA_VOL}:/mnt/mqm" \
+    -- \
+    "set -e; mkdir -p /mnt/mqm; chown -R 1001:0 /mnt/mqm; chmod -R ${MQDATA_PERMS} /mnt/mqm"
+
+  # ---------------------------
+  # DataPower volumes
+  # ---------------------------
+  log "INFO" "DataPower: ensuring volumes are writable..."
+  docker_run_shell "$DP_IMAGE" \
+    -u 0:0 \
+    -v "${DPCONFIG_VOL}:/cfg" \
+    -v "${DPLOCAL_VOL}:/loc" \
+    -v "${DPTMP_VOL}:/tmpdp" \
+    -- \
+    'set -e; mkdir -p /cfg /loc /tmpdp; chmod -R 0777 /cfg /loc /tmpdp || true'
+
+  log "INFO" "DataPower: seeding auto-startup.cfg into config volume..."
+  docker_run_shell "$DP_IMAGE" \
+    -u 0:0 \
+    -v "${DPCONFIG_VOL}:/cfg" \
+    -- \
+    "set -e; cat > /cfg/auto-startup.cfg <<'CFG'
+${DP_STARTUP_CONTENT}
+CFG
+chmod 0644 /cfg/auto-startup.cfg || true"
+
+  # ---------------------------
+  # ACE volume prep (offline)
+  # ---------------------------
+  log "INFO" "ACE: preparing workdir volume ownership (${ace_uid}:${ace_gid})..."
+  docker_run_shell "$ACE_IMAGE" \
+    -e LICENSE=accept \
+    -u 0:0 \
+    -v "${ACEWORK_VOL}:/workdir" \
+    -- \
+    "set -e; mkdir -p /workdir; chown -R ${ace_uid}:${ace_gid} /workdir; chmod -R u+rwX,g+rwX /workdir; find /workdir -type d -exec chmod 2775 {} \; 2>/dev/null || true"
+
+  if ! ace_volume_valid "$ACEWORK_VOL"; then
+    log "INFO" "ACE: initializing workdir via mqsicreateworkdir"
+    docker_run_shell "$ACE_IMAGE" \
+      -e LICENSE=accept \
+      -v "${ACEWORK_VOL}:/workdir" \
+      -- \
+      'set -e; mqsicreateworkdir /workdir; mkdir -p /workdir/overrides'
+  else
+    log "INFO" "ACE: workdir already initialized"
+  fi
+
+  log "INFO" "ACE: enabling auth + ensuring web user ${ACE_WEB_USER}"
+  docker_run_shell "$ACE_IMAGE" \
+    -e LICENSE=accept \
+    -e ACE_WEB_USER="${ACE_WEB_USER}" \
+    -e ACE_WEB_PASSWORD="${ACE_WEB_PASSWORD}" \
+    -v "${ACEWORK_VOL}:/workdir" \
+    -- \
+    '
+      set -e
+      mkdir -p /workdir/overrides
+      mqsichangeauthmode -w /workdir -b active
+      ( mqsiwebuseradmin -w /workdir -c -u "$ACE_WEB_USER" -a "$ACE_WEB_PASSWORD" ) \
+        || mqsiwebuseradmin -w /workdir -m -u "$ACE_WEB_USER" -a "$ACE_WEB_PASSWORD"
+    '
+
+  # ---------------------------
+  # Start MQ first (strict)
+  # ---------------------------
+  log "INFO" "Starting MQ only..."
+  docker compose up -d mq
+  docker compose ps mq
+
+  if ! wait_for_mq "$MQ_QMGR_NAME" 60 2; then
+    log "ERROR" "MQ did NOT reach RUNNING. Showing last logs and dumping diagnostics."
+    docker logs --tail 200 mq || true
+    dump_mq_diagnostics_from_volume "$MQDATA_VOL"
+    die "Fix MQ first (storage/perms/nosuid/FDC). Stack not started."
+  fi
+
+  # ---------------------------
+  # Start the rest only after MQ is healthy
+  # ---------------------------
+  log "INFO" "Starting ACE + DataPower..."
+  docker compose up -d ace datapower
   docker compose ps
 
-  log "INFO" "MQ Web Console: https://localhost:9443/ibmmq/console/"
-  log "INFO" "MQ login: admin / $(cat "$PROJECT_ROOT/secrets/mqAdminPassword")"
-  log "INFO" "ACE Web UI: http://localhost:7600  (czasem https://localhost:7843)"
-  log "INFO" "ACE login: ${ACE_WEB_USER} / $(cat "$PROJECT_ROOT/secrets/aceWebAdminPassword")"
+  log "INFO" "MQ Web Console : https://localhost:9443/ibmmq/console/"
+  log "INFO" "MQ login       : admin / (see $PROJECT_ROOT/secrets/mqAdminPassword)"
+  log "INFO" "ACE Web UI     : http://localhost:7600  (sometimes https://localhost:7843)"
+  log "INFO" "ACE login      : ${ACE_WEB_USER} / (see $PROJECT_ROOT/secrets/aceWebAdminPassword)"
   log "INFO" "DataPower WebGUI: https://localhost:${DP_WEBGUI_PORT}"
   log "INFO" "Done."
 
   popd >/dev/null
+  fix_project_ownership_if_root
 }
 
 main "$@"
+
