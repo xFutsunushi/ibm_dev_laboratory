@@ -33,7 +33,9 @@ ACE_WEB_USER="${ACE_WEB_USER:-Admin}"
 # DataPower WebGUI
 DP_WEBGUI_BIND="${DP_WEBGUI_BIND:-0.0.0.0}"
 DP_WEBGUI_PORT="${DP_WEBGUI_PORT:-9090}"
-DP_SSH_PORT="${DP_SSH_PORT:-65000}"
+# DataPower SSH (host vs container)
+DP_SSH_HOST_PORT="${DP_SSH_HOST_PORT:-65000}"       # na hoście (jak się łączysz)
+DP_SSH_CONTAINER_PORT="${DP_SSH_CONTAINER_PORT:-22}" # w kontenerze (default DP SSH)
 
 # Optional timeout for one-shot docker runs (seconds); 0 disables
 DOCKER_RUN_TIMEOUT="${DOCKER_RUN_TIMEOUT:-180}"
@@ -311,7 +313,7 @@ exit
 
 ssh
   admin-state enabled
-  local-address 0.0.0.0 ${DP_SSH_PORT}
+  local-address 0.0.0.0 ${DP_SSH_CONTAINER_PORT}
 exit
 
 write memory
@@ -418,7 +420,7 @@ services:
       - "${DP_WEBGUI_PORT:-9090}:${DP_WEBGUI_PORT:-9090}"
       - "5550:5550"
       - "9444:9443"
-      - "${DP_SSH_PORT:-65000}:${DP_SSH_PORT:-65000}"  # SSH: host=65000 kontener=65000
+      - "${DP_SSH_HOST_PORT:-65000}:${DP_SSH_CONTAINER_PORT:-22}"  # SSH: host=65000 kontener=65000
     volumes:
       - dpconfig:/opt/ibm/datapower/drouter/config
       - dplocal:/opt/ibm/datapower/drouter/local
