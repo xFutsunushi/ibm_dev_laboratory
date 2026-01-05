@@ -305,6 +305,7 @@ EOF
 
   # Make MQSC readable for MQ container (umask from secrets can make it 600)
   chmod 0644 "$PROJECT_ROOT/mq/mqsc/config.mqsc" || true
+  
   # DataPower web-mgmt: syntax is "local-address <address> <port>"
   DP_STARTUP_CONTENT="$(cat <<EOF
 top; configure terminal
